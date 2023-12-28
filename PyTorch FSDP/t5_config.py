@@ -22,5 +22,89 @@ class train_config(base_config):
 
     # tokenizer
     tokenizer = "t5-small"
-    
 
+    # checkpoint models
+    save_model_checkpoint: bool = False
+    load_model_checkpoint: bool = False
+    checkpoint_type = StateDictType.FULL_STATE_DICT
+    model_save_name = "t5-"
+    checkpoint_folder = "training_checkpoint"
+    checkpoint_max_save_count: int = (
+        2 # number of "best" checkpoint to save base on val loss
+    )
+
+    # optimizer load and save
+    save_optimizer: bool = False
+    load_optimizer: bool = False
+    optimizer_name: str = "Adam"
+    optimizer_checkpoint_file: str = "Adam-t5--1.pt"
+    checkpoint_model_filename: str = "t5--1.pt"
+
+    # datasets
+    dataset_train = "grammer/grammer_train.csv"
+    dataset_test = "grammer/grammer_text.csv"
+
+def build_model(model_name: str):
+    return AutoModelForSeq2SeqLM.from_pretrained(model_name)
+
+def get_dataset():
+    cfg = train_config()
+    train_name = cfg.dataset_train
+    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer, model_max_lenght=512)
+    train_dataset = dg.get_dataset(tokenizer, train_name, 512, 512, True)
+    return train_dataset
+
+def get_policy():
+    return get_policy_base({T5Block})
+
+def fsdp_checkpointing(model):
+    return fsdp_checkpointing_base(model, T5Block)
+
+def train(model, data_loader, torch_profiler, optimizer, memmax, local_rank, tracking_duration, total_step):
+    cfg = train_config()
+    model.train()
+    if local_rank == 0:
+        inner_pbar = tqdm.tqdm(
+            range(len(data_loader)), colour="blue", desc="r0 Trainaing Epoch"
+        )
+
+    batch_index = 0
+    t0 = time.perf_counter()
+    for batch in data_loader:
+        for key in batch.keys():
+            batch[key] = batch[key].to(local_rank)
+        if optimizer:
+            optimizer.zero_grad()
+        output = model(
+            input_ids = batch["source_ids"],
+            attention_mask = batch["source_mask"],
+            labels = batch["target_ids"]
+        )
+        loss = output["loss"]
+        loss.backward()
+        if optimizer:
+            optimizer.step()
+        
+        if local_rank == 0:
+            inner_pbar.update(1)
+        if torch_profiler:
+            torch_profiler.step()
+        
+        batch_index += 1
+        mini_batch_time = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        if local_rank == 0:
+            tracking_duration.append(mini_batch_time)
+        if (
+            batch_index % cfg.log_every == 0
+            and torch.distributed.get_rank() == 0
+            and batch_index > 1
+        ) : 
+            print(
+                f"step {batch_index-1}: time taken for the last {cfg.every_log} steps is {mini_batch_time} "
+            )
+        if batch_index > total_steps_to_run:
+            break
+    if local_rank == 0:
+        inner_pbar.close()
+        print("traincking_duration ", tracking_duration)

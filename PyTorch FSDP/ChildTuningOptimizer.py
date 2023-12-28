@@ -4,32 +4,51 @@ from typing import Callable, Iterable, Tuple
 from torch.distributions.bernoulli import Bernoulli
 import math
 
+
 class ChildTuningAdamW(Optimizer):
     def __init__(
         self,
         params: Iterable[torch.nn.parameter.Parameter],
         lr: float = 1e-3,
         betas: Tuple[float, float] = (0.9, 0.999),
-        eps: float = 1e-6,
+        eps: float = 1e-8,
         weight_decay: float = 0.0,
         correct_bias: bool = True,
-        reserve_p = 1.0,
-        mode = None
+        reserve_p=0.5,
+        mode=None,
     ):
         if lr < 0.0:
             raise ValueError("Invalid learning rate: {} - should be >= 0.0".format(lr))
         if not 0.0 <= betas[0] < 1.0:
-            raise ValueError("Invalid beta parameter: {} - should be in [0.0, 1.0[".format(betas[0]))
+            raise ValueError(
+                "Invalid beta parameter: {} - should be in [0.0, 1.0[".format(betas[0])
+            )
         if not 0.0 <= betas[1] < 1.0:
-            raise ValueError("Invalid beta parameter: {} - should be in [0.0, 1.0[".format(betas[1]))
+            raise ValueError(
+                "Invalid beta parameter: {} - should be in [0.0, 1.0[".format(betas[1])
+            )
         if not 0.0 <= eps:
             raise ValueError("Invalid epsilon value: {} - should be >= 0.0".format(eps))
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, correct_bias=correct_bias)
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            correct_bias=correct_bias,
+        )
         super().__init__(params, defaults)
 
         self.gradient_mask = None
         self.reserve_p = reserve_p
         self.mode = mode
+        if mode == "taskfree":
+            print(f"--> optimizer running with taskfree Child Tuning")
+        elif mode == "task":
+            print(f"--> optimizer running with fim masking active")
+        else:
+            print(
+                f"--> WARNING: No mode Set!  This is the same as running regular AdamW"
+            )
 
     def set_gradient_mask(self, gradient_mask):
         self.gradient_mask = gradient_mask
@@ -50,18 +69,26 @@ class ChildTuningAdamW(Optimizer):
                     continue
                 grad = p.grad.data
                 if grad.is_sparse:
-                    raise RuntimeError("Adam does not support sparse gradients, please consider SparseAdam instead")
+                    raise RuntimeError(
+                        "Adam does not support sparse gradients, please consider SparseAdam instead"
+                    )
 
-                # =================== HACK BEGIN =======================         
+                # =================== Child Tuning BEGIN =======================
                 if self.mode is not None:
-                    if self.mode == 'ChildTuning-D':
+                    if self.mode == "task":
                         if p in self.gradient_mask:
                             grad *= self.gradient_mask[p]
-                    else: 
+                    elif self.mode == "taskfree":
                         # ChildTuning-F
-                        grad_mask = Bernoulli(grad.new_full(size=grad.size(), fill_value=self.reserve_p))
+                        grad_mask = Bernoulli(
+                            grad.new_full(size=grad.size(), fill_value=self.reserve_p)
+                        )
                         grad *= grad_mask.sample() / self.reserve_p
-                # =================== HACK END =======================
+                    else:
+                        raise ValueError(
+                            "running Child Tuning optimizer but no mode set...aborting"
+                        )
+                # =================== Child Tuning END =======================
 
                 state = self.state[p]
 
@@ -88,7 +115,9 @@ class ChildTuningAdamW(Optimizer):
                 if group["correct_bias"]:  # No bias correction for Bert
                     bias_correction1 = 1.0 - beta1 ** state["step"]
                     bias_correction2 = 1.0 - beta2 ** state["step"]
-                    step_size = step_size * math.sqrt(bias_correction2) / bias_correction1
+                    step_size = (
+                        step_size * math.sqrt(bias_correction2) / bias_correction1
+                    )
 
                 p.data.addcdiv_(exp_avg, denom, value=-step_size)
 
